@@ -92,19 +92,38 @@ mywebsite/
 ├── index.html              # Main website HTML
 ├── styles.css              # Website styling
 ├── script.js               # Frontend JavaScript for chatbot
-├── app.py                  # Flask backend with RAG system
+├── app.py                  # Flask backend (for local development)
+├── api/
+│   └── chat.py            # Vercel serverless function
+├── vercel.json            # Vercel configuration
 ├── requirements.txt        # Python dependencies
 ├── .env.example           # Environment variables template
 ├── .gitignore             # Git ignore rules
 ├── README.md              # This file
+├── DEPLOYMENT.md          # Detailed Vercel deployment guide
+├── Procfile               # Heroku deployment config
 └── Deepak Cv Aug2025_original.docx  # Original resume document
 ```
 
 ## Deployment
 
-### Deploy to Production
+### Deploy to Vercel (Recommended)
 
-For production deployment, you can use:
+The easiest way to deploy this website is using Vercel:
+
+1. **Quick Deploy**
+   - Push your code to GitHub
+   - Visit https://vercel.com and import your repository
+   - Add `OPENAI_API_KEY` environment variable
+   - Deploy! Your site will be live in minutes
+
+2. **Detailed Instructions**
+   - See [DEPLOYMENT.md](DEPLOYMENT.md) for complete step-by-step guide
+   - Includes CLI deployment and troubleshooting
+
+### Other Deployment Options
+
+For production deployment, you can also use:
 
 1. **Heroku**
    ```bash
