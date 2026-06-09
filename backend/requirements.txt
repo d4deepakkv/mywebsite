@@ -7,3 +7,5 @@ pydantic-settings==2.7.0
 pyyaml==6.0.2
 httpx==0.28.1
 python-dotenv==1.0.1
+markdown==3.7
+xhtml2pdf==0.2.16

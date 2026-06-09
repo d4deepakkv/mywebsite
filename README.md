@@ -9,6 +9,8 @@ their **current manual process**, and — on demand — produces a structured
 - **Backend:** FastAPI + PostgreSQL (async SQLAlchemy), Claude via **OpenRouter**
 - **Frontend:** React (Vite)
 - **Bot setup:** edit [`backend/discovery_config.yaml`](backend/discovery_config.yaml)
+- **Streaming:** replies stream token-by-token over Server-Sent Events
+- **Export:** download the captured requirements as a polished **PDF** (or Markdown)
 
 ```
 ┌──────────────┐    POST /api/conversations/{id}/messages   ┌──────────────┐
@@ -81,13 +83,18 @@ Backend (`backend/.env`, see `.env.example`):
 
 | Method & path                              | Description                          |
 | ------------------------------------------ | ------------------------------------ |
-| `GET  /api/bot`                            | Bot name/description/welcome message |
-| `POST /api/conversations`                  | Start a session (returns opening msg)|
-| `POST /api/conversations/{id}/messages`    | Send a user message, get the reply   |
-| `GET  /api/conversations/{id}`             | Full conversation history            |
-| `POST /api/conversations/{id}/summary`     | Generate a requirements document     |
-| `GET  /api/conversations/{id}/summary`     | Latest generated requirements        |
-| `GET  /api/conversations`                  | List all sessions (admin view)       |
+| `GET  /api/bot`                              | Bot name/description/welcome message |
+| `POST /api/conversations`                    | Start a session (returns opening msg)|
+| `POST /api/conversations/{id}/messages`      | Send a user message, get the reply   |
+| `POST /api/conversations/{id}/messages/stream`| Same, but **streams** the reply (SSE)|
+| `GET  /api/conversations/{id}`               | Full conversation history            |
+| `POST /api/conversations/{id}/summary`       | Generate a requirements document     |
+| `GET  /api/conversations/{id}/summary`       | Latest generated requirements (JSON) |
+| `GET  /api/conversations/{id}/summary.pdf`   | Download requirements as a **PDF**    |
+| `GET  /api/conversations`                    | List all sessions (admin view)       |
+
+The streaming endpoint emits Server-Sent Events; each `data:` line is JSON of
+the form `{"type":"delta","text":"…"}`, ending with `{"type":"done","message":…}`.
 
 Interactive API docs are served at **http://localhost:8000/docs**.
 

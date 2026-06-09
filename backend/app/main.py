@@ -1,20 +1,23 @@
 """FastAPI application exposing the discovery chatbot API."""
 from __future__ import annotations
 
+import json
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from . import discovery, schemas
 from .config import get_settings, load_bot_config
-from .database import get_db, init_db
+from .database import SessionLocal, get_db, init_db
 from .llm import LLMError
 from .models import Conversation, Message, Requirement
+from .pdf import render_summary_pdf
 
 
 @asynccontextmanager
@@ -146,6 +149,84 @@ async def post_message(
     return schemas.ChatResponse(message=schemas.MessageOut.model_validate(assistant_msg))
 
 
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+@app.post("/api/conversations/{conversation_id}/messages/stream")
+async def post_message_stream(
+    conversation_id: uuid.UUID,
+    payload: schemas.MessageCreate,
+) -> StreamingResponse:
+    """Stream the assistant's reply token-by-token over Server-Sent Events.
+
+    Protocol (each line is ``data: <json>``):
+      * ``{"type": "delta", "text": "..."}``  — a chunk of assistant text
+      * ``{"type": "done",  "message": {...}}`` — final persisted message
+      * ``{"type": "error", "detail": "..."}`` — something went wrong
+    """
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    bot = load_bot_config()
+
+    # Persist the user's message and snapshot the history before streaming.
+    async with SessionLocal() as db:
+        conv = await _get_conversation(conversation_id, db)
+        conv.messages.append(Message(role="user", content=payload.content.strip()))
+        await db.commit()
+
+        rows = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at)
+        )
+        history = [{"role": m.role, "content": m.content} for m in rows.scalars()]
+        needs_title = conv.title is None
+
+    async def event_stream():
+        chunks: list[str] = []
+        try:
+            async for delta in discovery.generate_reply_stream(bot, history):
+                chunks.append(delta)
+                yield _sse({"type": "delta", "text": delta})
+        except LLMError as exc:
+            yield _sse({"type": "error", "detail": str(exc)})
+            return
+
+        text = "".join(chunks).strip()
+        # Persist the assistant message (+ a title on the first exchange).
+        async with SessionLocal() as db:
+            assistant_msg = Message(
+                conversation_id=conversation_id, role="assistant", content=text
+            )
+            db.add(assistant_msg)
+            if needs_title:
+                title = await discovery.generate_title(history)
+                if title:
+                    conv = await db.get(Conversation, conversation_id)
+                    conv.title = title
+            await db.commit()
+            await db.refresh(assistant_msg)
+            message = {
+                "id": str(assistant_msg.id),
+                "role": "assistant",
+                "content": text,
+                "created_at": assistant_msg.created_at.isoformat(),
+            }
+        yield _sse({"type": "done", "message": message})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable proxy buffering (nginx)
+        },
+    )
+
+
 @app.post(
     "/api/conversations/{conversation_id}/summary",
     response_model=schemas.RequirementOut,
@@ -195,3 +276,59 @@ async def get_latest_summary(
     if req is None:
         raise HTTPException(status_code=404, detail="No summary generated yet")
     return req
+
+
+@app.get("/api/conversations/{conversation_id}/summary.pdf")
+async def summary_pdf(
+    conversation_id: uuid.UUID,
+    regenerate: bool = False,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Return the requirements summary as a downloadable PDF.
+
+    Uses the latest stored summary, or generates one on the fly (and stores it)
+    if none exists yet or ``regenerate=true`` is passed.
+    """
+    conv = await _get_conversation(conversation_id, db)
+    bot = load_bot_config()
+
+    latest = None
+    if not regenerate:
+        result = await db.execute(
+            select(Requirement)
+            .where(Requirement.conversation_id == conversation_id)
+            .order_by(Requirement.created_at.desc())
+            .limit(1)
+        )
+        latest = result.scalar_one_or_none()
+
+    if latest is None:
+        if not any(m.role == "user" for m in conv.messages):
+            raise HTTPException(
+                status_code=400,
+                detail="Not enough conversation yet to generate requirements.",
+            )
+        try:
+            summary_md = await discovery.generate_summary(bot, list(conv.messages))
+        except LLMError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        latest = Requirement(
+            conversation_id=conv.id, content_markdown=summary_md
+        )
+        db.add(latest)
+        await db.commit()
+        await db.refresh(latest)
+
+    subtitle = conv.title or (conv.user_name and f"Session with {conv.user_name}")
+    pdf_bytes = render_summary_pdf(
+        latest.content_markdown,
+        title=f"{bot.name} — Requirements",
+        subtitle=subtitle or None,
+        generated_at=latest.created_at,
+    )
+    filename = f"requirements-{conv.id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

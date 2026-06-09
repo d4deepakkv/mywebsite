@@ -1,21 +1,30 @@
 """Core discovery logic: building prompts and generating replies / summaries."""
 from __future__ import annotations
 
-from typing import List
+from typing import AsyncIterator, Iterable, List, Tuple
 
 from .config import BotConfig
-from .llm import chat_completion
-from .models import Message
+from .llm import chat_completion, chat_completion_stream
 
 
-def _history_to_messages(
-    bot: BotConfig, history: List[Message]
-) -> List[dict]:
+def _normalize(history: Iterable) -> List[Tuple[str, str]]:
+    """Accept a list of ORM ``Message`` objects or ``{role, content}`` dicts."""
+    out: List[Tuple[str, str]] = []
+    for m in history:
+        if isinstance(m, dict):
+            role, content = m.get("role"), m.get("content")
+        else:
+            role, content = m.role, m.content
+        out.append((role, content))
+    return out
+
+
+def _history_to_messages(bot: BotConfig, history: Iterable) -> List[dict]:
     """Convert stored messages + bot config into an OpenAI-style message list."""
     msgs: List[dict] = [{"role": "system", "content": bot.system_prompt()}]
-    for m in history:
-        if m.role in ("user", "assistant"):
-            msgs.append({"role": m.role, "content": m.content})
+    for role, content in _normalize(history):
+        if role in ("user", "assistant"):
+            msgs.append({"role": role, "content": content})
     return msgs
 
 
@@ -28,7 +37,7 @@ async def opening_message(bot: BotConfig) -> str:
     return bot.welcome_message
 
 
-async def generate_reply(bot: BotConfig, history: List[Message]) -> str:
+async def generate_reply(bot: BotConfig, history: Iterable) -> str:
     """Generate the assistant's next discovery question/response."""
     messages = _history_to_messages(bot, history)
     return await chat_completion(
@@ -36,6 +45,19 @@ async def generate_reply(bot: BotConfig, history: List[Message]) -> str:
         temperature=bot.llm.temperature,
         max_tokens=bot.llm.max_tokens,
     )
+
+
+async def generate_reply_stream(
+    bot: BotConfig, history: Iterable
+) -> AsyncIterator[str]:
+    """Stream the assistant's next discovery response as text deltas."""
+    messages = _history_to_messages(bot, history)
+    async for delta in chat_completion_stream(
+        messages,
+        temperature=bot.llm.temperature,
+        max_tokens=bot.llm.max_tokens,
+    ):
+        yield delta
 
 
 SUMMARY_INSTRUCTION = """\
@@ -72,7 +94,7 @@ the user was vague, note it under Open Questions rather than guessing.
 """
 
 
-async def generate_summary(bot: BotConfig, history: List[Message]) -> str:
+async def generate_summary(bot: BotConfig, history: Iterable) -> str:
     """Produce a structured requirements summary from the conversation."""
     messages = _history_to_messages(bot, history)
     messages.append({"role": "user", "content": SUMMARY_INSTRUCTION})
@@ -83,9 +105,11 @@ async def generate_summary(bot: BotConfig, history: List[Message]) -> str:
     )
 
 
-async def generate_title(history: List[Message]) -> str | None:
+async def generate_title(history: Iterable) -> str | None:
     """Generate a short title from the first user message (best effort)."""
-    first_user = next((m for m in history if m.role == "user"), None)
+    first_user = next(
+        (content for role, content in _normalize(history) if role == "user"), None
+    )
     if not first_user:
         return None
     prompt = [
@@ -94,7 +118,7 @@ async def generate_title(history: List[Message]) -> str | None:
             "content": (
                 "Summarise the following request as a short title of at most 6 "
                 "words. Reply with ONLY the title, no quotes.\n\n"
-                f"{first_user.content[:500]}"
+                f"{first_user[:500]}"
             ),
         }
     ]

@@ -2,13 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import ChatMessage from "./components/ChatMessage.jsx";
 import SummaryPanel from "./components/SummaryPanel.jsx";
+import Composer from "./components/Composer.jsx";
+
+const STREAM_ID = "__assistant_streaming__";
 
 export default function App() {
   const [bot, setBot] = useState(null);
   const [conversationId, setConversationId] = useState(null);
   const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
+  const [streaming, setStreaming] = useState(false);
+  const [booting, setBooting] = useState(true);
   const [error, setError] = useState("");
 
   const [summary, setSummary] = useState(null);
@@ -20,46 +23,59 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const botInfo = await api.getBot();
-        setBot(botInfo);
+        setBot(await api.getBot());
         const conv = await api.createConversation();
         setConversationId(conv.id);
         setMessages(conv.messages || []);
       } catch (e) {
         setError(e.message);
+      } finally {
+        setBooting(false);
       }
     })();
   }, []);
 
-  // Auto-scroll to the newest message.
+  // Auto-scroll to the newest content as it streams in.
   useEffect(() => {
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [messages, sending]);
+  }, [messages]);
 
-  async function handleSend(e) {
-    e?.preventDefault();
-    const text = input.trim();
-    if (!text || sending || !conversationId) return;
-
+  async function handleSend(text) {
+    const content = text.trim();
+    if (!content || streaming || !conversationId) return;
     setError("");
-    setInput("");
-    // Optimistically render the user's message.
+
+    // Optimistically render the user's message + an empty streaming bubble.
     setMessages((m) => [
       ...m,
-      { id: `tmp-${Date.now()}`, role: "user", content: text },
+      { id: `user-${Date.now()}`, role: "user", content },
+      { id: STREAM_ID, role: "assistant", content: "", streaming: true },
     ]);
-    setSending(true);
-    try {
-      const { message } = await api.sendMessage(conversationId, text);
-      setMessages((m) => [...m, message]);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setSending(false);
-    }
+    setStreaming(true);
+
+    await api.streamMessage(conversationId, content, {
+      onDelta: (chunk) =>
+        setMessages((m) =>
+          m.map((msg) =>
+            msg.id === STREAM_ID
+              ? { ...msg, content: msg.content + chunk }
+              : msg
+          )
+        ),
+      onDone: (message) =>
+        setMessages((m) =>
+          m.map((msg) => (msg.id === STREAM_ID ? message : msg))
+        ),
+      onError: (detail) => {
+        setError(detail);
+        // Drop the empty streaming bubble on failure.
+        setMessages((m) => m.filter((msg) => msg.id !== STREAM_ID));
+      },
+    });
+    setStreaming(false);
   }
 
   async function handleSummary() {
@@ -67,8 +83,7 @@ export default function App() {
     setSummaryLoading(true);
     setError("");
     try {
-      const req = await api.generateSummary(conversationId);
-      setSummary(req);
+      setSummary(await api.generateSummary(conversationId));
     } catch (e) {
       setError(e.message);
     } finally {
@@ -93,21 +108,31 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <div>
-          <h1>{bot?.name || "Discovery Assistant"}</h1>
-          {bot?.description && <p className="subtitle">{bot.description}</p>}
+        <div className="brand">
+          <div className="brand-mark">{(bot?.name || "D")[0]}</div>
+          <div>
+            <h1>
+              {bot?.name || "Discovery Assistant"}
+              <span className="status-dot" title="Online" />
+            </h1>
+            {bot?.description && <p className="subtitle">{bot.description}</p>}
+          </div>
         </div>
         <div className="header-actions">
           <button
-            className="btn ghost"
+            className="btn primary"
             onClick={handleSummary}
-            disabled={!hasUserMessages || summaryLoading}
-            title="Generate a requirements summary from this conversation"
+            disabled={!hasUserMessages || summaryLoading || streaming}
+            title="Summarise everything captured so far"
           >
-            {summaryLoading ? "Summarising…" : "Generate requirements"}
+            {summaryLoading ? (
+              <span className="spinner" />
+            ) : (
+              <>📋 Requirements</>
+            )}
           </button>
-          <button className="btn ghost" onClick={handleRestart}>
-            New session
+          <button className="btn ghost" onClick={handleRestart} title="Start over">
+            ＋ New
           </button>
         </div>
       </header>
@@ -115,40 +140,43 @@ export default function App() {
       <div className="layout">
         <main className="chat-pane">
           <div className="messages" ref={scrollRef}>
-            {messages.map((m) => (
-              <ChatMessage key={m.id} role={m.role} content={m.content} />
-            ))}
-            {sending && (
-              <ChatMessage role="assistant" content="…" typing />
+            {booting && (
+              <div className="boot">
+                <span className="spinner" /> Preparing your session…
+              </div>
             )}
+            {messages.map((m) => (
+              <ChatMessage
+                key={m.id}
+                role={m.role}
+                content={m.content}
+                streaming={m.streaming && m.content.length === 0}
+                caret={m.streaming && m.content.length > 0}
+              />
+            ))}
           </div>
 
-          {error && <div className="error-banner">{error}</div>}
+          {error && (
+            <div className="error-banner" role="alert">
+              <span>⚠️ {error}</span>
+              <button onClick={() => setError("")} aria-label="Dismiss">
+                ✕
+              </button>
+            </div>
+          )}
 
-          <form className="composer" onSubmit={handleSend}>
-            <textarea
-              value={input}
-              placeholder="Type your answer…"
-              rows={1}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) handleSend(e);
-              }}
-              disabled={sending || !conversationId}
-            />
-            <button
-              className="btn primary"
-              type="submit"
-              disabled={sending || !input.trim()}
-            >
-              Send
-            </button>
-          </form>
+          <Composer onSend={handleSend} disabled={streaming || !conversationId} />
+          <p className="composer-hint">
+            The assistant asks one question at a time. When you're done, hit{" "}
+            <strong>Requirements</strong> to get a summary and PDF.
+          </p>
         </main>
 
         {summary && (
           <SummaryPanel
             summary={summary}
+            conversationId={conversationId}
+            onError={setError}
             onClose={() => setSummary(null)}
           />
         )}
